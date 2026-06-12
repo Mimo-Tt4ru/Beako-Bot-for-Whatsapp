@@ -1,0 +1,83 @@
+import { loadEnv } from '../../bootstrap/env.js'
+import type { RowDataPacket } from 'mysql2/promise'
+import { config } from '../../config/index.js'
+import { createLogger } from '../../observability/logger.js'
+import { getMysqlPool } from './mysql.js'
+import { ensureMysqlConnection } from './connection.js'
+
+loadEnv()
+const logger = createLogger()
+
+type TableRow = RowDataPacket & { table_name: string }
+type ColumnRow = RowDataPacket & { count: number }
+
+/**
+ * Verifica a quantidade de registros por tabela para a conexão atual,
+ * ajudando a inspecionar rapidamente a integridade do banco.
+ */
+async function main() {
+  if (!config.mysqlUrl) {
+    logger.error('MYSQL_URL nao configurada')
+    process.exitCode = 1
+    return
+  }
+
+  const pool = getMysqlPool()
+  if (!pool) {
+    logger.error('Pool MySQL nao iniciado')
+    process.exitCode = 1
+    return
+  }
+
+  await ensureMysqlConnection(pool)
+
+  const connectionId = config.connectionId ?? 'default'
+  logger.info('verificando tabelas', { connectionId })
+
+  const [tableRows] = await pool.execute<TableRow[]>(
+    `SELECT table_name AS table_name
+     FROM information_schema.tables
+     WHERE table_schema = DATABASE()
+     ORDER BY table_name`
+  )
+
+  for (const row of tableRows) {
+    const table = row.table_name
+    try {
+      const [columns] = await pool.execute<ColumnRow[]>(
+        `SELECT COUNT(*) AS count
+         FROM information_schema.columns
+         WHERE table_schema = DATABASE()
+           AND table_name = ?
+           AND column_name = 'connection_id'`,
+        [table]
+      )
+      const hasConnectionId = (columns[0]?.count ?? 0) > 0
+      if (hasConnectionId) {
+        type CountRow = RowDataPacket & { count: number }
+        const [rows] = await pool.execute<CountRow[]>(`SELECT COUNT(*) AS count FROM \`${table}\` WHERE connection_id = ?`, [connectionId])
+        const count = rows[0]?.count ?? 0
+        logger.info(`tabela ${table}`, { count })
+      } else if (table === 'connections') {
+        type CountRow = RowDataPacket & { count: number }
+        const [rows] = await pool.execute<CountRow[]>(`SELECT COUNT(*) AS count FROM \`connections\` WHERE id = ?`, [connectionId])
+        const count = rows[0]?.count ?? 0
+        logger.info(`tabela ${table}`, { count })
+      } else {
+        type CountRow = RowDataPacket & { count: number }
+        const [rows] = await pool.execute<CountRow[]>(`SELECT COUNT(*) AS count FROM \`${table}\``)
+        const count = rows[0]?.count ?? 0
+        logger.info(`tabela ${table}`, { count })
+      }
+    } catch (error) {
+      logger.error(`falha ao consultar tabela ${table}`, { err: error })
+    }
+  }
+
+  await pool.end()
+}
+
+main().catch((error) => {
+  logger.error('falha ao verificar tabelas', { err: error })
+  process.exitCode = 1
+})

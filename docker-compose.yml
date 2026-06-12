@@ -1,0 +1,74 @@
+services:
+  Beako:
+    build: .
+    restart: unless-stopped
+    volumes:
+      - beako-data:/app/data
+    environment:
+      # Modo simples: uma única conexão explícita.
+      WA_CONNECTION_ID: default
+      # Para múltiplas conexões no mesmo processo, prefira definir WA_CONNECTION_IDS no .env.
+      # Exemplo: WA_CONNECTION_IDS=default,loja1,loja2
+      # Sem WA_CONNECTION_IDS, o bootstrap ainda pode descobrir conexões em auth_creds.
+      WA_REDIS_URL: redis://redis:6379
+      MYSQL_URL: mysql://beako:beako@mysql:3306/beako
+      WA_ANTIBAN_ENABLED: 'true'
+      WA_ANTIBAN_METRICS_ENABLED: 'true'
+    ports:
+      - '9108:9108' # Prometheus metrics
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+
+  backfill:
+    build: .
+    restart: unless-stopped
+    command: ['node', 'dist/core/db/backfill.js']
+    volumes:
+      - beako-data:/app/data
+    environment:
+      WA_CONNECTION_ID: default
+      MYSQL_URL: mysql://beako:beako@mysql:3306/beako
+      WA_BACKFILL_ONCE: 'false'
+      WA_BACKFILL_INTERVAL_MS: '30000'
+    depends_on:
+      mysql:
+        condition: service_healthy
+    env_file:
+      - .env
+
+  mysql:
+    image: mysql:8.0
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: beako
+      MYSQL_USER: beako
+      MYSQL_PASSWORD: beako
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ['CMD', 'mysqladmin', 'ping', '-h', 'localhost']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  beako-data:
+  mysql-data:
+  redis-data:

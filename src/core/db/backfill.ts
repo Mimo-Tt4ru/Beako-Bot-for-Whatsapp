@@ -1,0 +1,1722 @@
+import { randomUUID } from 'node:crypto'
+import { stat } from 'node:fs/promises'
+import path from 'node:path'
+import { type AuthenticationCreds, BufferJSON, type GroupMetadata, type WAMessage } from 'baileys'
+import type { ResultSetHeader, RowDataPacket } from 'mysql2/promise'
+import { createHash } from 'node:crypto'
+import { loadEnv } from '../../bootstrap/env.js'
+import { config } from '../../config/index.js'
+import { createLogger } from '../../observability/logger.js'
+import { ensureMysqlConnection } from './connection.js'
+import { getMysqlPool } from './mysql.js'
+import { normalizeDisplayNameCandidate, pickBetterDisplayName } from '../../utils/display-name.js'
+import { getMessageText, getNormalizedMessage } from '../../utils/message.js'
+
+loadEnv()
+const logger = createLogger()
+
+type NumberEnvOptions = {
+  min?: number
+  allowZero?: boolean
+  integer?: boolean
+}
+
+const MAX_LENGTHS = {
+  jid: 128,
+  messageId: 128,
+  lidPn: 64,
+  labelId: 64,
+  displayName: 255,
+  userIdentifier: 255,
+  alias: 255,
+  role: 32,
+  groupRole: 16,
+  eventTypeShort: 64,
+  eventTypeLong: 128,
+  commandName: 64,
+  contentType: 64,
+  messageType: 64,
+  status: 32,
+  color: 16,
+}
+
+const readNumberEnv = (key: string, fallback: number, options: NumberEnvOptions = {}) => {
+  const raw = process.env[key]
+  if (raw === undefined || raw === '') return fallback
+  const parsed = Number(raw)
+  const min = options.min ?? (options.allowZero ? 0 : 1)
+  if (!Number.isFinite(parsed) || parsed < min) {
+    logger.warn('env invalida, usando fallback', { key, value: raw, fallback })
+    return fallback
+  }
+  return options.integer === false ? parsed : Math.trunc(parsed)
+}
+
+const BATCH_SIZE = readNumberEnv('WA_BACKFILL_BATCH_SIZE', 500)
+const WORKER_INTERVAL_MS = readNumberEnv('WA_BACKFILL_INTERVAL_MS', 30000, { min: 5000 })
+const MAX_PASSES_PER_CYCLE = readNumberEnv('WA_BACKFILL_MAX_PASSES', 20, { min: 1 })
+
+const logAffected = (label: string, result: ResultSetHeader) => {
+  if (result.affectedRows) {
+    logger.info('backfill atualizado', { item: label, affected: result.affectedRows })
+  }
+}
+
+const serialize = (value: unknown) => JSON.stringify(value, BufferJSON.replacer)
+const deserialize = <T>(value: unknown) => {
+  if (value === null || value === undefined) return null as T
+  if (typeof value === 'string') {
+    return JSON.parse(value, BufferJSON.reviver) as T
+  }
+  return JSON.parse(JSON.stringify(value), BufferJSON.reviver) as T
+}
+
+const normalizeString = (value: unknown, options: { maxLength?: number; allowEmpty?: boolean; trim?: boolean; truncate?: boolean } = {}): string | null => {
+  if (typeof value !== 'string') return null
+  const trimmed = options.trim === false ? value : value.trim()
+  if (!trimmed && !options.allowEmpty) return null
+  if (options.maxLength && trimmed.length > options.maxLength) {
+    if (options.truncate) return trimmed.slice(0, options.maxLength)
+    return null
+  }
+  return trimmed
+}
+
+const normalizePnLid = (value: unknown): string | null => normalizeString(value, { maxLength: MAX_LENGTHS.lidPn })
+
+const normalizeDisplayName = (value: unknown): string | null => {
+  const normalized = normalizeString(value, { maxLength: MAX_LENGTHS.displayName, truncate: true })
+  return normalizeDisplayNameCandidate(normalized)
+}
+
+const toNumber = (value: unknown): number | null => {
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  if (typeof value === 'bigint') return Number(value)
+  if (value && typeof value === 'object') {
+    const maybeNumber = value as { toNumber?: () => number }
+    if (typeof maybeNumber.toNumber === 'function') {
+      return maybeNumber.toNumber()
+    }
+  }
+  if (value === null || value === undefined) return null
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? parsed : null
+}
+
+const toTinyInt = (value: boolean | null | undefined): number | null => {
+  if (value === null || value === undefined) return null
+  return value ? 1 : 0
+}
+
+type CheckpointStep = 'messages' | 'message_events' | 'events_log'
+
+const CHECKPOINT_TABLE = 'backfill_checkpoints'
+
+const BACKFILL_METRICS = [
+  { key: 'groups.owner_user_id', query: `SELECT COUNT(*) AS count FROM \`groups\` WHERE connection_id = ? AND owner_user_id IS NULL` },
+  { key: 'lid_mappings.user_id', query: `SELECT COUNT(*) AS count FROM lid_mappings WHERE connection_id = ? AND user_id IS NULL` },
+  { key: 'wa_contacts_cache.user_id', query: `SELECT COUNT(*) AS count FROM wa_contacts_cache WHERE connection_id = ? AND user_id IS NULL` },
+  { key: 'wa_contacts_cache.display_name', query: `SELECT COUNT(*) AS count FROM wa_contacts_cache WHERE connection_id = ? AND (display_name IS NULL OR display_name = '')` },
+  { key: 'chats.display_name', query: `SELECT COUNT(*) AS count FROM chats WHERE connection_id = ? AND (display_name IS NULL OR display_name = '')` },
+  { key: 'chats.unread_count', query: `SELECT COUNT(*) AS count FROM chats WHERE connection_id = ? AND unread_count IS NULL` },
+  { key: 'users.display_name', query: `SELECT COUNT(*) AS count FROM users WHERE connection_id = ? AND (display_name IS NULL OR display_name = '')` },
+  { key: 'messages.sender_user_id', query: `SELECT COUNT(*) AS count FROM messages WHERE connection_id = ? AND sender_user_id IS NULL` },
+  { key: 'messages.timestamp', query: `SELECT COUNT(*) AS count FROM messages WHERE connection_id = ? AND timestamp IS NULL` },
+  { key: 'messages.is_ephemeral', query: `SELECT COUNT(*) AS count FROM messages WHERE connection_id = ? AND is_ephemeral IS NULL` },
+  { key: 'message_events.actor_user_id', query: `SELECT COUNT(*) AS count FROM message_events WHERE connection_id = ? AND actor_user_id IS NULL` },
+  { key: 'message_events.target_user_id', query: `SELECT COUNT(*) AS count FROM message_events WHERE connection_id = ? AND target_user_id IS NULL` },
+  { key: 'message_events.message_db_id', query: `SELECT COUNT(*) AS count FROM message_events WHERE connection_id = ? AND message_db_id IS NULL` },
+  { key: 'chat_users.role', query: `SELECT COUNT(*) AS count FROM chat_users WHERE connection_id = ? AND role IS NULL` },
+  { key: 'group_participants.role', query: `SELECT COUNT(*) AS count FROM group_participants WHERE connection_id = ? AND role IS NULL` },
+] as const
+
+const isSortMemoryError = (error: unknown): boolean => {
+  if (!error || typeof error !== 'object') return false
+  const candidate = error as { code?: string; errno?: number }
+  return candidate.code === 'ER_OUT_OF_SORTMEMORY' || candidate.errno === 1038
+}
+
+const normalizeIdentifier = (value: string | null | undefined): string | null => normalizeString(value, { maxLength: MAX_LENGTHS.userIdentifier, truncate: true })
+
+const pickString = (obj: Record<string, unknown> | null, keys: string[]) => {
+  if (!obj) return null
+  for (const key of keys) {
+    const value = obj[key]
+    if (typeof value === 'string' && value.trim()) return value
+  }
+  return null
+}
+
+const pickFrom = (obj: Record<string, unknown> | null, keys: string[]) => {
+  const direct = pickString(obj, keys)
+  if (direct) return direct
+  const nested = obj?.data && typeof obj.data === 'object' ? (obj.data as Record<string, unknown>) : null
+  return pickString(nested, keys)
+}
+
+const isUserJid = (jid: string) => jid.includes('@') && !jid.endsWith('@g.us') && !jid.endsWith('@newsletter') && jid !== 'status@broadcast'
+
+const userIdCache = new Map<string, string>()
+const cacheKey = (type: string, value: string) => `${type}:${value}`
+const cacheUserId = (userId: string, identifiers: Array<{ type: string; value: string }>) => {
+  if (userIdCache.size > 10000) userIdCache.clear() // Prevent memory leak
+  for (const ident of identifiers) {
+    userIdCache.set(cacheKey(ident.type, ident.value), userId)
+  }
+}
+
+const buildUserMaterializationLockKey = (connectionId: string, identifiers: Array<{ type: string; value: string }>) => {
+  const serialized = identifiers
+    .map((entry) => `${entry.type}:${entry.value}`)
+    .sort()
+    .join('|')
+  const digest = createHash('sha1').update(`${connectionId}:${serialized}`).digest('hex')
+  return `beako:user:${digest}`
+}
+
+/**
+ * Executa o worker de backfill responsável por recomputar e completar
+ * colunas derivadas e vínculos relacionais no banco.
+ */
+async function main() {
+  if (!config.mysqlUrl) {
+    logger.error('MYSQL_URL nao configurada')
+    process.exitCode = 1
+    return
+  }
+
+  const pool = getMysqlPool()
+  if (!pool) {
+    logger.error('Pool MySQL nao iniciado')
+    process.exitCode = 1
+    return
+  }
+
+  await ensureMysqlConnection(pool)
+
+  const connectionId = config.connectionId ?? 'default'
+  logger.info('iniciando backfill worker', { connectionId, interval: WORKER_INTERVAL_MS })
+
+  await pool.execute(
+    `CREATE TABLE IF NOT EXISTS ${CHECKPOINT_TABLE} (
+       connection_id VARCHAR(128) NOT NULL,
+       step_name VARCHAR(64) NOT NULL,
+       last_id BIGINT UNSIGNED NOT NULL DEFAULT 0,
+       updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+       PRIMARY KEY (connection_id, step_name)
+     ) ENGINE=InnoDB`
+  )
+
+  type CheckpointRow = RowDataPacket & { last_id: number }
+  const getCheckpoint = async (step: CheckpointStep): Promise<number> => {
+    const [rows] = await pool.execute<CheckpointRow[]>(
+      `SELECT last_id
+       FROM ${CHECKPOINT_TABLE}
+       WHERE connection_id = ?
+         AND step_name = ?
+       LIMIT 1`,
+      [connectionId, step]
+    )
+    return Number(rows[0]?.last_id ?? 0)
+  }
+
+  const setCheckpoint = async (step: CheckpointStep, lastId: number) => {
+    await pool.execute(
+      `INSERT INTO ${CHECKPOINT_TABLE} (connection_id, step_name, last_id)
+       VALUES (?, ?, ?)
+       ON DUPLICATE KEY UPDATE
+         last_id = GREATEST(last_id, VALUES(last_id))`,
+      [connectionId, step, Math.max(0, Math.trunc(lastId))]
+    )
+  }
+
+  const collectBackfillMetrics = async () => {
+    type CountRow = RowDataPacket & { count: number }
+    const snapshot: Record<string, number> = {}
+    for (const metric of BACKFILL_METRICS) {
+      const [rows] = await pool.execute<CountRow[]>(metric.query, [connectionId])
+      snapshot[metric.key] = Number(rows[0]?.count ?? 0)
+    }
+    return snapshot
+  }
+
+  const resolveSelfJid = async (): Promise<string | null> => {
+    type CredsRow = RowDataPacket & { creds_json: unknown }
+    const [rows] = await pool.execute<CredsRow[]>(
+      `SELECT creds_json
+       FROM auth_creds
+       WHERE connection_id = ?
+       LIMIT 1`,
+      [connectionId]
+    )
+    const creds = rows[0]?.creds_json ? deserialize<AuthenticationCreds>(rows[0].creds_json) : null
+    const jid = normalizeIdentifier((creds as { me?: { id?: string | null } } | null)?.me?.id ?? null)
+    return jid
+  }
+
+  const selfJid = await resolveSelfJid()
+
+  type UserIdentifierType = 'jid' | 'pn' | 'lid' | 'username'
+
+  const normalizeUserIdentifier = (entry: { type: UserIdentifierType; value: string }): { type: UserIdentifierType; value: string } | null => {
+    switch (entry.type) {
+      case 'jid': {
+        const jid = normalizeIdentifier(entry.value)
+        if (!jid) return null
+        if (jid.endsWith('@lid')) {
+          return { type: 'lid', value: jid }
+        }
+        return { type: 'jid', value: jid }
+      }
+      case 'pn':
+      case 'lid': {
+        const value = normalizePnLid(entry.value)
+        return value ? { type: entry.type, value } : null
+      }
+      case 'username': {
+        const value = normalizeIdentifier(entry.value)
+        return value ? { type: 'username', value } : null
+      }
+      default:
+        return null
+    }
+  }
+
+  const buildUserIdentifierLookupVariants = (entry: { type: UserIdentifierType; value: string }): Array<{ type: UserIdentifierType; value: string }> => {
+    if (entry.type === 'lid' && entry.value.endsWith('@lid')) {
+      return [entry, { type: 'jid', value: entry.value }]
+    }
+    return [entry]
+  }
+
+  const resolveUserIdentifierEntries = (value: string | null | undefined): Array<{ type: UserIdentifierType; value: string }> => {
+    const normalizedJid = normalizeIdentifier(value)
+    if (normalizedJid?.includes('@')) {
+      const entry = normalizeUserIdentifier({ type: 'jid', value: normalizedJid })
+      return entry ? [entry] : []
+    }
+    const normalizedLid = normalizePnLid(value)
+    if (!normalizedLid) return []
+    const entry = normalizeUserIdentifier({ type: 'lid', value: normalizedLid })
+    return entry ? [entry] : []
+  }
+
+  const resolveMessageSenderIdentifierEntries = (message: WAMessage): Array<{ type: UserIdentifierType; value: string }> => {
+    const key = message.key
+    if (key?.fromMe) {
+      return resolveUserIdentifierEntries(selfJid ?? key.participant ?? null)
+    }
+    if (key?.participant) {
+      return resolveUserIdentifierEntries(key.participant)
+    }
+    const remoteJid = normalizeIdentifier(key?.remoteJid ?? null)
+    if (!remoteJid) return []
+    if (remoteJid.endsWith('@s.whatsapp.net') || remoteJid.endsWith('@lid')) {
+      return resolveUserIdentifierEntries(remoteJid)
+    }
+    return []
+  }
+
+  const ensureUserByIdentifiers = async (identifiers: Array<{ type: UserIdentifierType; value: string }>, displayName?: string | null) => {
+    const clean = identifiers.map((entry) => normalizeUserIdentifier(entry)).filter((entry): entry is { type: UserIdentifierType; value: string } => Boolean(entry?.value))
+    if (!clean.length) return null
+    const lookup = clean.flatMap(buildUserIdentifierLookupVariants).filter((entry, index, entries) => entries.findIndex((item) => item.type === entry.type && item.value === entry.value) === index)
+
+    const cachedUserId = lookup.map((entry) => userIdCache.get(cacheKey(entry.type, entry.value))).find((value): value is string => Boolean(value)) ?? null
+
+    if (cachedUserId) {
+      if (displayName) {
+        await pool.execute(
+          `UPDATE users
+           SET display_name = ?
+           WHERE connection_id = ?
+             AND id = UNHEX(REPLACE(?, '-', ''))
+             AND (display_name IS NULL OR display_name = '')`,
+          [displayName, connectionId, cachedUserId]
+        )
+      }
+      return cachedUserId
+    }
+
+    const connection = await pool.getConnection()
+    const lockKey = buildUserMaterializationLockKey(connectionId, lookup)
+    let lockAcquired = false
+
+    try {
+      const [lockRows] = await connection.query<RowDataPacket[]>(`SELECT GET_LOCK(?, 10) AS acquired`, [lockKey])
+      lockAcquired = Number(lockRows[0]?.acquired ?? 0) === 1
+      if (!lockAcquired) {
+        throw new Error('nao foi possivel adquirir lock de materializacao de usuario no backfill')
+      }
+
+      await connection.beginTransaction()
+      try {
+        type UserRow = RowDataPacket & { user_id: string; id_type: string; id_value: string }
+        const whereClauses = lookup.map(() => `(id_type = ? AND id_value = ?)`).join(' OR ')
+        const whereParams = lookup.flatMap((entry) => [entry.type, entry.value])
+        const [rows] = await connection.execute<UserRow[]>(
+          `SELECT LOWER(CONCAT(HEX(SUBSTR(user_id, 1, 4)),'-',HEX(SUBSTR(user_id, 5, 2)),'-',HEX(SUBSTR(user_id, 7, 2)),'-',HEX(SUBSTR(user_id, 9, 2)),'-',HEX(SUBSTR(user_id, 11, 6)))) AS user_id, id_type, id_value
+           FROM user_identifiers
+           WHERE connection_id = ?
+             AND (${whereClauses})`,
+          [connectionId, ...whereParams]
+        )
+        const existing = rows[0]?.user_id
+        if (existing) {
+          if (displayName) {
+            await connection.execute(
+              `UPDATE users
+               SET display_name = ?
+               WHERE connection_id = ?
+                 AND id = UNHEX(REPLACE(?, '-', ''))
+                 AND (display_name IS NULL OR display_name = '')`,
+              [displayName, connectionId, existing]
+            )
+          }
+          for (const ident of clean) {
+            await connection.execute(
+              `INSERT INTO user_identifiers (connection_id, user_id, id_type, id_value)
+               VALUES (?, UNHEX(REPLACE(?, '-', '')), ?, ?)
+               ON DUPLICATE KEY UPDATE user_id = VALUES(user_id)`,
+              [connectionId, existing, ident.type, ident.value]
+            )
+          }
+          await connection.commit()
+          cacheUserId(
+            existing,
+            rows.map((row) => ({ type: row.id_type, value: row.id_value }))
+          )
+          cacheUserId(existing, clean)
+          return existing
+        }
+
+        const userId = randomUUID()
+        await connection.execute(
+          `INSERT INTO users (id, connection_id, display_name)
+           VALUES (UNHEX(REPLACE(?, '-', '')), ?, ?)`,
+          [userId, connectionId, displayName ?? null]
+        )
+        for (const ident of clean) {
+          await connection.execute(
+            `INSERT INTO user_identifiers (connection_id, user_id, id_type, id_value)
+             VALUES (?, UNHEX(REPLACE(?, '-', '')), ?, ?)
+             ON DUPLICATE KEY UPDATE user_id = VALUES(user_id)`,
+            [connectionId, userId, ident.type, ident.value]
+          )
+        }
+        await connection.commit()
+        cacheUserId(userId, clean)
+        return userId
+      } catch (error) {
+        await connection.rollback()
+        throw error
+      }
+    } catch (error) {
+      logger.warn('falha na materializacao atomica de usuario no backfill', {
+        connectionId,
+        err: error,
+        identifierCount: lookup.length,
+        identifierTypes: lookup.map((entry) => entry.type),
+        lockAcquired,
+      })
+      throw error
+    } finally {
+      if (lockAcquired) {
+        try {
+          await connection.query(`SELECT RELEASE_LOCK(?)`, [lockKey])
+        } catch {
+          // noop
+        }
+      }
+      connection.release()
+    }
+  }
+
+  const ensureUserByJid = async (jid: string, displayName?: string | null) => ensureUserByIdentifiers([{ type: 'jid', value: jid }], displayName)
+
+  let cachedSelfUserId: string | null | undefined
+  const ensureSelfUserId = async (): Promise<string | null> => {
+    if (cachedSelfUserId !== undefined) return cachedSelfUserId
+    cachedSelfUserId = selfJid ? await ensureUserByIdentifiers([{ type: 'jid', value: selfJid }], null) : null
+    return cachedSelfUserId
+  }
+
+  const asRecord = (value: unknown): Record<string, unknown> | null => {
+    if (typeof value !== 'object' || value === null) return null
+    return value as Record<string, unknown>
+  }
+
+  const getNestedValue = (value: unknown, path: string[]): unknown => {
+    let current: unknown = value
+    for (const part of path) {
+      const record = asRecord(current)
+      if (!record || !(part in record)) return null
+      current = record[part]
+    }
+    return current
+  }
+
+  const pickNestedString = (value: unknown, paths: string[][]): string | null => {
+    for (const path of paths) {
+      const candidate = getNestedValue(value, path)
+      if (typeof candidate === 'string' && candidate.trim()) return candidate
+    }
+    return null
+  }
+
+  const pickNestedNumber = (value: unknown, paths: string[][]): number | null => {
+    for (const path of paths) {
+      const candidate = getNestedValue(value, path)
+      const number = toNumber(candidate)
+      if (number !== null) return number
+    }
+    return null
+  }
+
+  const normalizeUnreadCount = (value: unknown): number | null => {
+    const count = toNumber(value)
+    if (count === null || !Number.isFinite(count) || count < 0) return null
+    return Math.trunc(count)
+  }
+
+  const extractChatFallbackDisplayName = (chatData: Record<string, unknown> | null): string | null => {
+    if (!chatData) return null
+    const direct = pickNestedString(chatData, [['name'], ['subject'], ['formattedTitle'], ['displayName'], ['notify'], ['pushName']])
+    if (direct) return normalizeDisplayName(direct)
+    const messages = Array.isArray(chatData.messages) ? chatData.messages : []
+    for (const item of messages) {
+      const pushName = pickNestedString(item, [['message', 'pushName']])
+      if (pushName) return normalizeDisplayName(pushName)
+    }
+    return null
+  }
+
+  const extractChatFallbackLastMessageTs = (chatData: Record<string, unknown> | null): number | null => {
+    if (!chatData) return null
+    const direct = pickNestedNumber(chatData, [['conversationTimestamp']])
+    if (direct !== null) return direct
+    const messages = Array.isArray(chatData.messages) ? chatData.messages : []
+    for (const item of messages) {
+      const ts = pickNestedNumber(item, [['message', 'messageTimestamp']])
+      if (ts !== null) return ts
+    }
+    return null
+  }
+
+  const extractChatFallbackUnreadCount = (chatData: Record<string, unknown> | null): number | null => {
+    if (!chatData) return null
+    return normalizeUnreadCount(getNestedValue(chatData, ['unreadCount']))
+  }
+
+  const resolveMessageDbId = async (chatJid: string | null, messageId: string | null, fromMe?: boolean | null): Promise<number | null> => {
+    const normalizedChat = normalizeIdentifier(chatJid)
+    const normalizedMessageId = normalizeIdentifier(messageId)
+    if (!normalizedChat || !normalizedMessageId) return null
+    type MessageIdRow = RowDataPacket & { id: number }
+    const params: Array<string | number> = [connectionId, normalizedChat, normalizedMessageId]
+    const fromMeClause = typeof fromMe === 'boolean' ? ' AND from_me = ?' : ''
+    if (typeof fromMe === 'boolean') {
+      params.push(fromMe ? 1 : 0)
+    }
+    const [rows] = await pool.execute<MessageIdRow[]>(
+      `SELECT id
+       FROM messages
+       WHERE connection_id = ?
+         AND chat_jid = ?
+         AND message_id = ?${fromMeClause}
+       ORDER BY id DESC
+       LIMIT 1`,
+      params
+    )
+    return rows[0]?.id ?? null
+  }
+
+  const getMessageSenderUserId = async (messageDbId: number | null): Promise<string | null> => {
+    if (!messageDbId) return null
+    type SenderRow = RowDataPacket & { sender_user_id: string | null }
+    const [rows] = await pool.execute<SenderRow[]>(
+      `SELECT LOWER(CONCAT(HEX(SUBSTR(sender_user_id, 1, 4)),'-',HEX(SUBSTR(sender_user_id, 5, 2)),'-',HEX(SUBSTR(sender_user_id, 7, 2)),'-',HEX(SUBSTR(sender_user_id, 9, 2)),'-',HEX(SUBSTR(sender_user_id, 11, 6)))) AS sender_user_id
+       FROM messages
+       WHERE connection_id = ?
+         AND id = ?
+         AND sender_user_id IS NOT NULL
+       LIMIT 1`,
+      [connectionId, messageDbId]
+    )
+    return rows[0]?.sender_user_id ?? null
+  }
+
+  const resolveEventActorJid = (record: Record<string, unknown>) => pickNestedString(record, [['actorJid'], ['actor'], ['author'], ['from'], ['sender'], ['receipt', 'userJid'], ['key', 'participant']])
+
+  const dedupeUserIdentifierEntries = (entries: Array<{ type: UserIdentifierType; value: string }>) => {
+    const seen = new Set<string>()
+    return entries.filter((entry) => {
+      const key = `${entry.type}:${entry.value}`
+      if (seen.has(key)) return false
+      seen.add(key)
+      return true
+    })
+  }
+
+  const resolveEventActorIdentifierEntries = (record: Record<string, unknown>) => dedupeUserIdentifierEntries(resolveUserIdentifierEntries(resolveEventActorJid(record)))
+
+  const resolveEventTargetIdentifierEntries = (record: Record<string, unknown>) => {
+    const entries: Array<{ type: UserIdentifierType; value: string }> = []
+    const paths: string[][] = [['targetJid'], ['user'], ['participant'], ['contactJid'], ['receipt', 'userJid'], ['reaction', 'participant'], ['id'], ['pn'], ['lid']]
+    for (const path of paths) {
+      const candidate = pickNestedString(record, [path])
+      if (!candidate) continue
+      entries.push(...resolveUserIdentifierEntries(candidate))
+    }
+    return dedupeUserIdentifierEntries(entries)
+  }
+
+  const resolveEventChatJid = (record: Record<string, unknown>) => {
+    const candidate = pickNestedString(record, [['chatJid'], ['chatId'], ['jid'], ['id'], ['key', 'remoteJid']])
+    return candidate && candidate.includes('@') ? candidate : null
+  }
+
+  const resolveEventGroupJid = (record: Record<string, unknown>) => {
+    const candidate = pickNestedString(record, [['groupJid'], ['groupId'], ['id'], ['chatId'], ['key', 'remoteJid']])
+    return candidate && candidate.endsWith('@g.us') ? candidate : null
+  }
+
+  const resolveEventMessageKey = (record: Record<string, unknown>) => {
+    const remoteJid = pickNestedString(record, [['key', 'remoteJid'], ['chatJid'], ['chatId'], ['jid']])
+    const messageId = pickNestedString(record, [['key', 'id'], ['messageId'], ['stanzaId']])
+    if (!remoteJid || !messageId) return null
+    const fromMeValue = getNestedValue(record, ['key', 'fromMe'])
+    return {
+      chatJid: remoteJid,
+      messageId,
+      fromMe: typeof fromMeValue === 'boolean' ? fromMeValue : null,
+    }
+  }
+
+  const setChatUser = async (chatJid: string, userJid: string, role?: string | null) => {
+    const normalizedChat = normalizeIdentifier(chatJid)
+    const normalizedUser = normalizeIdentifier(userJid)
+    if (!normalizedChat || !normalizedUser) return
+    const userId = await ensureUserByJid(normalizedUser)
+    if (!userId) return
+    const resolvedRole = role ?? 'member'
+    await pool.execute(
+      `INSERT INTO chat_users (
+         connection_id,
+         chat_jid,
+         user_id,
+         role
+       )
+       VALUES (?, ?, UNHEX(REPLACE(?, '-', '')), ?)
+       ON DUPLICATE KEY UPDATE
+         role = VALUES(role)`,
+      [connectionId, normalizedChat, userId, resolvedRole]
+    )
+  }
+
+  const backfillGroupsAndParticipants = async () => {
+    type GroupRow = RowDataPacket & { jid: string; data_json: unknown }
+    const [groupRows] = await pool.execute<GroupRow[]>(`SELECT jid, data_json FROM \`groups\` WHERE connection_id = ?`, [connectionId])
+    for (const row of groupRows) {
+      const group = deserialize<GroupMetadata>(row.data_json)
+      if (!group) continue
+      const ownerCandidates: Array<{ type: UserIdentifierType; value: string }> = []
+      const pushOwnerCandidate = (type: UserIdentifierType, value: string | null | undefined) => {
+        const normalized = type === 'jid' ? normalizeIdentifier(value ?? null) : normalizePnLid(value ?? null)
+        if (normalized) ownerCandidates.push({ type, value: normalized })
+      }
+      pushOwnerCandidate('jid', group.owner)
+      const ownerMeta = group as {
+        ownerPn?: string | null
+        subjectOwner?: string | null
+        subjectOwnerPn?: string | null
+        descOwner?: string | null
+        descOwnerPn?: string | null
+        author?: string | null
+        authorPn?: string | null
+      }
+      pushOwnerCandidate('pn', ownerMeta.ownerPn)
+      pushOwnerCandidate('jid', ownerMeta.subjectOwner)
+      pushOwnerCandidate('pn', ownerMeta.subjectOwnerPn)
+      pushOwnerCandidate('jid', ownerMeta.descOwner)
+      pushOwnerCandidate('pn', ownerMeta.descOwnerPn)
+      pushOwnerCandidate('jid', ownerMeta.author)
+      pushOwnerCandidate('pn', ownerMeta.authorPn)
+
+      const subject = normalizeDisplayName(group.subject ?? null)
+      const announce = toTinyInt(group.announce ?? null)
+      const restrict = toTinyInt(group.restrict ?? null)
+      const size = typeof group.size === 'number' && Number.isFinite(group.size) ? group.size : null
+
+      let ownerUserId: string | null = null
+      if (ownerCandidates.length) {
+        ownerUserId = await ensureUserByIdentifiers(ownerCandidates, null)
+      }
+
+      if (ownerUserId || subject !== null || announce !== null || restrict !== null || size !== null) {
+        await pool.execute(
+          `UPDATE \`groups\`
+           SET owner_user_id = COALESCE(owner_user_id, IF(?, UNHEX(REPLACE(?, '-', '')), NULL)),
+               subject = IF(subject IS NULL OR subject = '', ?, subject),
+               announce = COALESCE(announce, ?),
+               \`restrict\` = COALESCE(\`restrict\`, ?),
+               size = COALESCE(size, ?)
+           WHERE connection_id = ?
+             AND jid = ?`,
+          [ownerUserId ? 1 : 0, ownerUserId, subject, announce, restrict, size, connectionId, row.jid]
+        )
+      }
+      if (group?.participants?.length) {
+        for (const participant of group.participants) {
+          const jid = normalizeIdentifier(participant.id)
+          if (!jid) continue
+          const userId = await ensureUserByJid(jid)
+          if (!userId) continue
+          const role = participant.admin ?? 'member'
+          const isSuper = role === 'superadmin'
+          const isAdmin = role === 'admin' || isSuper
+          await pool.execute(
+            `INSERT INTO group_participants (
+               connection_id,
+               group_jid,
+               user_id,
+               participant_jid,
+               role,
+               is_admin,
+               is_superadmin,
+               data_json
+             )
+             VALUES (?, ?, UNHEX(REPLACE(?, '-', '')), ?, ?, ?, ?, ?)
+             ON DUPLICATE KEY UPDATE
+               participant_jid = VALUES(participant_jid),
+               role = VALUES(role),
+               is_admin = VALUES(is_admin),
+               is_superadmin = VALUES(is_superadmin),
+               data_json = VALUES(data_json)`,
+            [connectionId, row.jid, userId, jid, role, isAdmin ? 1 : 0, isSuper ? 1 : 0, serialize(participant)]
+          )
+          await setChatUser(row.jid, jid, role)
+        }
+      }
+    }
+  }
+
+  const backfillContactsUserId = async () => {
+    const [contactsResult] = await pool.execute<ResultSetHeader>(
+      `UPDATE wa_contacts_cache wc
+       INNER JOIN user_identifiers ui
+         ON ui.connection_id = wc.connection_id
+        AND ui.id_type = 'jid'
+        AND ui.id_value = wc.jid
+       SET wc.user_id = ui.user_id
+       WHERE wc.connection_id = ?
+         AND wc.user_id IS NULL`,
+      [connectionId]
+    )
+    logAffected('wa_contacts_cache.user_id', contactsResult)
+  }
+
+  const backfillLidMappings = async () => {
+    const [lidPnResult] = await pool.execute<ResultSetHeader>(
+      `UPDATE lid_mappings lm
+       INNER JOIN user_identifiers ui
+         ON ui.connection_id = lm.connection_id
+        AND ui.id_type = 'pn'
+        AND ui.id_value = lm.pn
+       SET lm.user_id = ui.user_id
+       WHERE lm.connection_id = ?
+         AND lm.user_id IS NULL`,
+      [connectionId]
+    )
+    logAffected('lid_mappings.user_id(pn)', lidPnResult)
+
+    const [lidResult] = await pool.execute<ResultSetHeader>(
+      `UPDATE lid_mappings lm
+       INNER JOIN user_identifiers ui
+         ON ui.connection_id = lm.connection_id
+        AND ui.id_type = 'lid'
+        AND ui.id_value = lm.lid
+       SET lm.user_id = ui.user_id
+       WHERE lm.connection_id = ?
+         AND lm.user_id IS NULL`,
+      [connectionId]
+    )
+    logAffected('lid_mappings.user_id(lid)', lidResult)
+  }
+
+  const backfillUsersDisplayNames = async () => {
+    type UserDisplayCandidateRow = RowDataPacket & {
+      user_id: string
+      current_display_name: string | null
+      candidate_display_name: string | null
+    }
+
+    const applyUserDisplayNameCandidates = async (label: string, query: string, params: Array<string | number>) => {
+      const [rows] = await pool.execute<UserDisplayCandidateRow[]>(query, params)
+      let updated = 0
+      for (const row of rows) {
+        const current = normalizeDisplayName(row.current_display_name)
+        const candidate = normalizeDisplayName(row.candidate_display_name)
+        const better = pickBetterDisplayName(current, candidate)
+        if (!better || better === current) continue
+        await pool.execute(
+          `UPDATE users
+           SET display_name = ?
+           WHERE connection_id = ?
+             AND id = UNHEX(REPLACE(?, '-', ''))`,
+          [better, connectionId, row.user_id]
+        )
+        updated += 1
+      }
+      if (updated) logger.info('backfill atualizado', { item: label, affected: updated })
+    }
+
+    for (const aliasType of ['display_name', 'notify', 'pushName', 'username'] as const) {
+      await applyUserDisplayNameCandidates(
+        `users.display_name(${aliasType})`,
+        `SELECT LOWER(CONCAT(HEX(SUBSTR(u.id, 1, 4)),'-',HEX(SUBSTR(u.id, 5, 2)),'-',HEX(SUBSTR(u.id, 7, 2)),'-',HEX(SUBSTR(u.id, 9, 2)),'-',HEX(SUBSTR(u.id, 11, 6)))) AS user_id,
+                u.display_name AS current_display_name,
+                ua.alias_value AS candidate_display_name
+         FROM users u
+         INNER JOIN user_aliases ua
+           ON ua.connection_id = u.connection_id
+          AND ua.user_id = u.id
+          AND ua.alias_type = ?
+         WHERE u.connection_id = ?`,
+        [aliasType, connectionId]
+      )
+    }
+
+    await applyUserDisplayNameCandidates(
+      'users.display_name(contacts)',
+      `SELECT LOWER(CONCAT(HEX(SUBSTR(u.id, 1, 4)),'-',HEX(SUBSTR(u.id, 5, 2)),'-',HEX(SUBSTR(u.id, 7, 2)),'-',HEX(SUBSTR(u.id, 9, 2)),'-',HEX(SUBSTR(u.id, 11, 6)))) AS user_id,
+              u.display_name AS current_display_name,
+              wc.display_name AS candidate_display_name
+       FROM users u
+       INNER JOIN user_identifiers ui
+         ON ui.connection_id = u.connection_id
+        AND ui.user_id = u.id
+        AND ui.id_type = 'jid'
+       INNER JOIN wa_contacts_cache wc
+         ON wc.connection_id = ui.connection_id
+        AND wc.jid = ui.id_value
+       WHERE u.connection_id = ?`,
+      [connectionId]
+    )
+
+    await applyUserDisplayNameCandidates(
+      'users.display_name(chats)',
+      `SELECT LOWER(CONCAT(HEX(SUBSTR(u.id, 1, 4)),'-',HEX(SUBSTR(u.id, 5, 2)),'-',HEX(SUBSTR(u.id, 7, 2)),'-',HEX(SUBSTR(u.id, 9, 2)),'-',HEX(SUBSTR(u.id, 11, 6)))) AS user_id,
+              u.display_name AS current_display_name,
+              c.display_name AS candidate_display_name
+       FROM users u
+       INNER JOIN user_identifiers ui
+         ON ui.connection_id = u.connection_id
+        AND ui.user_id = u.id
+        AND ui.id_type = 'jid'
+       INNER JOIN chats c
+         ON c.connection_id = ui.connection_id
+        AND c.jid = ui.id_value
+       WHERE u.connection_id = ?
+         AND c.jid NOT LIKE '%@g.us'
+         AND c.jid NOT LIKE '%@newsletter'`,
+      [connectionId]
+    )
+  }
+
+  const backfillContactsDisplayNames = async () => {
+    type ContactDisplayCandidateRow = RowDataPacket & {
+      jid: string
+      current_display_name: string | null
+      candidate_display_name: string | null
+    }
+
+    const applyContactDisplayNameCandidates = async (label: string, query: string, params: Array<string | number>) => {
+      const [rows] = await pool.execute<ContactDisplayCandidateRow[]>(query, params)
+      let updated = 0
+      let skippedNoSource = 0
+      let skippedGuardSameValue = 0
+      let skippedGuardWorseCandidate = 0
+      for (const row of rows) {
+        const current = normalizeDisplayName(row.current_display_name)
+        const candidate = normalizeDisplayName(row.candidate_display_name)
+        if (!candidate) {
+          skippedNoSource += 1
+          continue
+        }
+        const better = pickBetterDisplayName(current, candidate)
+        if (!better) {
+          skippedGuardWorseCandidate += 1
+          continue
+        }
+        if (better === current) {
+          skippedGuardSameValue += 1
+          continue
+        }
+        await pool.execute(
+          `UPDATE wa_contacts_cache
+           SET display_name = ?
+           WHERE connection_id = ?
+             AND jid = ?`,
+          [better, connectionId, row.jid]
+        )
+        updated += 1
+      }
+      logger.info('backfill step stats', {
+        step: label,
+        candidateRows: rows.length,
+        updated,
+        skipped: {
+          noSource: skippedNoSource,
+          guardSameValue: skippedGuardSameValue,
+          guardWorseCandidate: skippedGuardWorseCandidate,
+        },
+      })
+      if (updated) logger.info('backfill atualizado', { item: label, affected: updated })
+    }
+
+    await applyContactDisplayNameCandidates(
+      'wa_contacts_cache.display_name(users)',
+      `SELECT wc.jid, wc.display_name AS current_display_name, u.display_name AS candidate_display_name
+       FROM wa_contacts_cache wc
+       INNER JOIN users u
+         ON u.connection_id = wc.connection_id
+        AND u.id = wc.user_id
+       WHERE wc.connection_id = ?`,
+      [connectionId]
+    )
+
+    type ContactRow = RowDataPacket & { jid: string; display_name: string | null; data_json: unknown }
+    const [rows] = await pool.execute<ContactRow[]>(
+      `SELECT jid, display_name, data_json
+       FROM wa_contacts_cache
+       WHERE connection_id = ?
+       LIMIT ${BATCH_SIZE}`,
+      [connectionId]
+    )
+
+    let updatedFromJson = 0
+    let skippedNoSourceFromJson = 0
+    let skippedGuardSameValueFromJson = 0
+    let skippedGuardWorseCandidateFromJson = 0
+    for (const row of rows) {
+      const contactData = deserialize<Record<string, unknown>>(row.data_json)
+      const candidateDisplayName = normalizeDisplayName(pickNestedString(contactData, [['name'], ['notify'], ['pushName'], ['verifiedName'], ['fullName']]))
+      const currentDisplayName = normalizeDisplayName(row.display_name)
+      if (!candidateDisplayName) {
+        skippedNoSourceFromJson += 1
+        continue
+      }
+      const betterDisplayName = pickBetterDisplayName(currentDisplayName, candidateDisplayName)
+      if (!betterDisplayName) {
+        skippedGuardWorseCandidateFromJson += 1
+        continue
+      }
+      if (betterDisplayName === currentDisplayName) {
+        skippedGuardSameValueFromJson += 1
+        continue
+      }
+      await pool.execute(
+        `UPDATE wa_contacts_cache
+         SET display_name = ?
+         WHERE connection_id = ?
+           AND jid = ?`,
+        [betterDisplayName, connectionId, row.jid]
+      )
+      updatedFromJson += 1
+    }
+    logger.info('backfill step stats', {
+      step: 'wa_contacts_cache.display_name(data_json)',
+      candidateRows: rows.length,
+      updated: updatedFromJson,
+      skipped: {
+        noSource: skippedNoSourceFromJson,
+        guardSameValue: skippedGuardSameValueFromJson,
+        guardWorseCandidate: skippedGuardWorseCandidateFromJson,
+      },
+    })
+    if (updatedFromJson) logger.info('backfill atualizado', { item: 'wa_contacts_cache.display_name(data_json)', affected: updatedFromJson })
+  }
+
+  const backfillChats = async () => {
+    type ChatDisplayCandidateRow = RowDataPacket & {
+      jid: string
+      current_display_name: string | null
+      candidate_display_name: string | null
+    }
+
+    const applyChatDisplayNameCandidates = async (label: string, query: string, params: Array<string | number>) => {
+      const [rows] = await pool.execute<ChatDisplayCandidateRow[]>(query, params)
+      let updated = 0
+      for (const row of rows) {
+        const current = normalizeDisplayName(row.current_display_name)
+        const candidate = normalizeDisplayName(row.candidate_display_name)
+        const better = pickBetterDisplayName(current, candidate)
+        if (!better || better === current) continue
+        await pool.execute(
+          `UPDATE chats
+           SET display_name = ?
+           WHERE connection_id = ?
+             AND jid = ?`,
+          [better, connectionId, row.jid]
+        )
+        updated += 1
+      }
+      if (updated) logger.info('backfill atualizado', { item: label, affected: updated })
+    }
+
+    await applyChatDisplayNameCandidates(
+      'chats.display_name(groups)',
+      `SELECT c.jid, c.display_name AS current_display_name, g.subject AS candidate_display_name
+       FROM chats c
+       INNER JOIN \`groups\` g
+         ON g.connection_id = c.connection_id
+        AND g.jid = c.jid
+       WHERE c.connection_id = ?`,
+      [connectionId]
+    )
+
+    await applyChatDisplayNameCandidates(
+      'chats.display_name(newsletters)',
+      `SELECT c.jid,
+              c.display_name AS current_display_name,
+              COALESCE(
+                JSON_UNQUOTE(JSON_EXTRACT(n.data_json, '$.name.text')),
+                JSON_UNQUOTE(JSON_EXTRACT(n.data_json, '$.name'))
+              ) AS candidate_display_name
+       FROM chats c
+       INNER JOIN newsletters n
+         ON n.connection_id = c.connection_id
+        AND n.newsletter_id = c.jid
+       WHERE c.connection_id = ?`,
+      [connectionId]
+    )
+
+    await applyChatDisplayNameCandidates(
+      'chats.display_name(contacts)',
+      `SELECT c.jid, c.display_name AS current_display_name, wc.display_name AS candidate_display_name
+       FROM chats c
+       INNER JOIN wa_contacts_cache wc
+         ON wc.connection_id = c.connection_id
+        AND wc.jid = c.jid
+       WHERE c.connection_id = ?`,
+      [connectionId]
+    )
+
+    await applyChatDisplayNameCandidates(
+      'chats.display_name(users)',
+      `SELECT c.jid, c.display_name AS current_display_name, u.display_name AS candidate_display_name
+       FROM chats c
+       INNER JOIN user_identifiers ui
+         ON ui.connection_id = c.connection_id
+        AND ui.id_type = 'jid'
+        AND ui.id_value = c.jid
+       INNER JOIN users u
+         ON u.connection_id = ui.connection_id
+        AND u.id = ui.user_id
+       WHERE c.connection_id = ?
+         AND c.jid NOT LIKE '%@g.us'
+         AND c.jid NOT LIKE '%@newsletter'`,
+      [connectionId]
+    )
+
+    const [messageTs] = await pool.execute<ResultSetHeader>(
+      `UPDATE chats c
+       INNER JOIN (
+         SELECT connection_id, chat_jid, MAX(timestamp) AS last_ts
+         FROM messages
+         WHERE connection_id = ?
+           AND timestamp IS NOT NULL
+         GROUP BY connection_id, chat_jid
+       ) m
+         ON m.connection_id = c.connection_id
+        AND m.chat_jid = c.jid
+       SET c.last_message_ts = m.last_ts
+       WHERE c.connection_id = ?
+         AND c.last_message_ts IS NULL`,
+      [connectionId, connectionId]
+    )
+    logAffected('chats.last_message_ts(messages)', messageTs)
+
+    const [unreadCount] = await pool.execute<ResultSetHeader>(
+      `UPDATE chats
+       SET unread_count = CAST(JSON_UNQUOTE(JSON_EXTRACT(data_json, '$.unreadCount')) AS UNSIGNED)
+       WHERE connection_id = ?
+         AND unread_count IS NULL
+         AND JSON_EXTRACT(data_json, '$.unreadCount') IS NOT NULL`,
+      [connectionId]
+    )
+    logAffected('chats.unread_count(data_json)', unreadCount)
+
+    type ChatRow = RowDataPacket & {
+      jid: string
+      display_name: string | null
+      last_message_ts: number | null
+      unread_count: number | null
+      data_json: unknown
+    }
+    const [rows] = await pool.execute<ChatRow[]>(
+      `SELECT jid, display_name, last_message_ts, unread_count, data_json
+       FROM chats
+       WHERE connection_id = ?
+         AND (
+           display_name IS NULL OR display_name = ''
+           OR last_message_ts IS NULL
+           OR unread_count IS NULL
+         )
+       LIMIT ${BATCH_SIZE}`,
+      [connectionId]
+    )
+
+    for (const row of rows) {
+      const chatData = deserialize<Record<string, unknown>>(row.data_json)
+      const fallbackDisplayName = extractChatFallbackDisplayName(chatData)
+      const displayName = pickBetterDisplayName(normalizeDisplayName(row.display_name), fallbackDisplayName)
+      const lastMessageTs = row.last_message_ts ?? extractChatFallbackLastMessageTs(chatData)
+      const unread = row.unread_count ?? extractChatFallbackUnreadCount(chatData)
+      if (!displayName && lastMessageTs === null && unread === null) continue
+      await pool.execute(
+        `UPDATE chats
+         SET display_name = ?,
+             last_message_ts = COALESCE(last_message_ts, ?),
+             unread_count = COALESCE(unread_count, ?)
+         WHERE connection_id = ?
+           AND jid = ?`,
+        [displayName, lastMessageTs, unread, connectionId, row.jid]
+      )
+    }
+  }
+
+  const backfillChatUsersDirect = async () => {
+    type ChatRow = RowDataPacket & { jid: string }
+    const [chatRows] = await pool.execute<ChatRow[]>(`SELECT jid FROM chats WHERE connection_id = ? AND jid NOT LIKE '%@g.us'`, [connectionId])
+    for (const row of chatRows) {
+      await setChatUser(row.jid, row.jid, 'member')
+    }
+  }
+
+  const backfillMessages = async () => {
+    type IdRow = RowDataPacket & { id: number }
+    let idRows: IdRow[] = []
+    const lastCheckpoint = await getCheckpoint('messages')
+    try {
+      const [rows] = await pool.query<IdRow[]>(
+        `SELECT id
+         FROM messages
+         WHERE connection_id = ?
+           AND id > ?
+           AND (
+             sender_user_id IS NULL
+             OR timestamp IS NULL
+             OR is_ephemeral IS NULL
+           )
+         ORDER BY id ASC
+         LIMIT ${BATCH_SIZE}`,
+        [connectionId, lastCheckpoint]
+      )
+      idRows = rows
+    } catch (error) {
+      if (!isSortMemoryError(error)) throw error
+      const fallbackBatchSize = Math.max(50, Math.min(BATCH_SIZE, 200))
+      logger.warn('backfillMessages: sort buffer insuficiente, aplicando fallback sem ORDER BY', {
+        connectionId,
+        fallbackBatchSize,
+      })
+      const [rows] = await pool.query<IdRow[]>(
+        `SELECT id
+         FROM messages
+         WHERE connection_id = ?
+           AND id > ?
+           AND (
+             sender_user_id IS NULL
+             OR timestamp IS NULL
+             OR is_ephemeral IS NULL
+           )
+         LIMIT ${fallbackBatchSize}`,
+        [connectionId, lastCheckpoint]
+      )
+      idRows = rows
+    }
+
+    if (!idRows.length) {
+      await setCheckpoint('messages', 0)
+      return
+    }
+    const ids = idRows.map((row) => row.id)
+
+    type MessageRow = RowDataPacket & {
+      id: number
+      chat_jid: string
+      message_id: string
+      from_me: number
+      data_json: unknown
+    }
+
+    const [rows] = await pool.query<MessageRow[]>(
+      `SELECT id, chat_jid, message_id, from_me, data_json
+       FROM messages
+       WHERE id IN (?)`,
+      [ids]
+    )
+    rows.sort((left, right) => left.id - right.id)
+
+    const stats = {
+      selectedRows: rows.length,
+      checkpointFrom: lastCheckpoint,
+      checkpointTo: ids[ids.length - 1] ?? lastCheckpoint,
+      updated: {
+        sender_user_id: 0,
+        timestamp: 0,
+        is_ephemeral: 0,
+      },
+      skipped: {
+        noSource: {
+          sender_user_id: 0,
+          timestamp: 0,
+          is_ephemeral: 0,
+        },
+        alreadyConverged: 0,
+      },
+      errors: {
+        deserialize: 0,
+      },
+    }
+
+    for (const row of rows) {
+      const message = deserialize<WAMessage>(row.data_json)
+      if (!message?.key) {
+        stats.errors.deserialize += 1
+        continue
+      }
+
+      const normalized = getNormalizedMessage(message)
+      const messageText = getMessageText(message)
+      const timestamp = toNumber(message.messageTimestamp)
+      const contentType = normalized.type ? normalizeString(String(normalized.type), { maxLength: MAX_LENGTHS.contentType }) : null
+      const messageType = message.messageStubType !== undefined && message.messageStubType !== null ? normalizeString(String(message.messageStubType), { maxLength: MAX_LENGTHS.messageType }) : null
+      const status = message.status !== undefined && message.status !== null ? normalizeString(String(message.status), { maxLength: MAX_LENGTHS.status }) : null
+      const isForwarded = toTinyInt(
+        (() => {
+          if (!normalized.type || !normalized.content) return null
+          const inner = normalized.content[normalized.type]
+          if (!inner || typeof inner !== 'object') return null
+          const contextInfo = (inner as { contextInfo?: { isForwarded?: boolean; forwardingScore?: number } }).contextInfo
+          if (!contextInfo) return null
+          if (typeof contextInfo.isForwarded === 'boolean') return contextInfo.isForwarded
+          if (typeof contextInfo.forwardingScore === 'number') return contextInfo.forwardingScore > 0
+          return null
+        })()
+      )
+      const isEphemeral = message.message ? toTinyInt(Boolean(message.message.ephemeralMessage || message.message.viewOnceMessage || message.message.viewOnceMessageV2 || message.message.viewOnceMessageV2Extension)) : null
+      const textPreview = normalizeString(messageText, { maxLength: 512, truncate: true, trim: false })
+
+      if (timestamp === null) stats.skipped.noSource.timestamp += 1
+      if (isEphemeral === null) stats.skipped.noSource.is_ephemeral += 1
+
+      await pool.execute(
+        `UPDATE messages SET
+            timestamp = COALESCE(timestamp, ?),
+            content_type = IF(content_type IS NULL OR content_type = '', ?, content_type),
+            message_type = IF(message_type IS NULL OR message_type = '', ?, message_type),
+            status = IF(status IS NULL OR status = '', ?, status),
+            is_forwarded = COALESCE(is_forwarded, ?),
+            is_ephemeral = COALESCE(is_ephemeral, ?),
+            text_preview = IF(text_preview IS NULL OR text_preview = '', ?, text_preview)
+         WHERE connection_id = ? AND id = ?`,
+        [timestamp, contentType, messageType, status, isForwarded, isEphemeral, textPreview, connectionId, row.id]
+      )
+      if (timestamp !== null) stats.updated.timestamp += 1
+      if (isEphemeral !== null) stats.updated.is_ephemeral += 1
+
+      const senderIdentifierEntries = resolveMessageSenderIdentifierEntries(message)
+      if (senderIdentifierEntries.length) {
+        const senderUserId = await ensureUserByIdentifiers(senderIdentifierEntries)
+        if (senderUserId) {
+          await pool.execute(
+            `UPDATE messages SET sender_user_id = UNHEX(REPLACE(?, '-', ''))
+             WHERE connection_id = ? AND id = ? AND sender_user_id IS NULL`,
+            [senderUserId, connectionId, row.id]
+          )
+          stats.updated.sender_user_id += 1
+        } else {
+          stats.skipped.noSource.sender_user_id += 1
+        }
+      } else {
+        stats.skipped.noSource.sender_user_id += 1
+      }
+    }
+
+    logger.info('backfill step stats', { step: 'messages', ...stats })
+    await setCheckpoint('messages', ids[ids.length - 1] ?? lastCheckpoint)
+  }
+
+  const backfillMessageEvents = async () => {
+    const [fromMessages] = await pool.execute<ResultSetHeader>(
+      `UPDATE message_events me
+       INNER JOIN messages m
+         ON m.connection_id = me.connection_id
+        AND m.chat_jid = me.chat_jid
+        AND m.message_id = me.message_id
+       SET me.message_db_id = COALESCE(me.message_db_id, m.id),
+           me.target_user_id = COALESCE(me.target_user_id, m.sender_user_id)
+       WHERE me.connection_id = ?
+         AND (me.message_db_id IS NULL OR me.target_user_id IS NULL)`,
+      [connectionId]
+    )
+    logAffected('message_events.refs(messages)', fromMessages)
+
+    type MessageEventRow = RowDataPacket & {
+      id: number
+      chat_jid: string
+      message_id: string
+      actor_user_id: Buffer | null
+      target_user_id: Buffer | null
+      message_db_id: number | null
+      data_json: unknown
+    }
+    const lastCheckpoint = await getCheckpoint('message_events')
+    const [rows] = await pool.execute<MessageEventRow[]>(
+      `SELECT id, chat_jid, message_id, actor_user_id, target_user_id, message_db_id, data_json
+       FROM message_events
+       WHERE connection_id = ?
+         AND id > ?
+         AND (
+           actor_user_id IS NULL
+           OR target_user_id IS NULL
+           OR message_db_id IS NULL
+         )
+       ORDER BY id ASC
+       LIMIT ${BATCH_SIZE}`,
+      [connectionId, lastCheckpoint]
+    )
+
+    if (!rows.length) {
+      await setCheckpoint('message_events', 0)
+      return
+    }
+
+    const stats = {
+      selectedRows: rows.length,
+      updated: {
+        actor_user_id: 0,
+        target_user_id: 0,
+        message_db_id: 0,
+      },
+      resolved: {
+        targetFromMessageSender: 0,
+      },
+      skipped: {
+        noSource: {
+          actor_user_id: 0,
+          target_user_id: 0,
+          message_db_id: 0,
+        },
+      },
+      errors: {
+        deserialize: 0,
+      },
+    }
+
+    for (const row of rows) {
+      const record = deserialize<Record<string, unknown>>(row.data_json)
+      if (!record) {
+        stats.errors.deserialize += 1
+        continue
+      }
+      const messageKey = resolveEventMessageKey(record)
+      const messageDbId = row.message_db_id ?? (messageKey ? await resolveMessageDbId(messageKey.chatJid, messageKey.messageId, messageKey.fromMe) : null)
+      const senderUserId = await getMessageSenderUserId(messageDbId)
+      const actorEntries = !row.actor_user_id ? resolveEventActorIdentifierEntries(record) : []
+      const targetEntries = !row.target_user_id ? resolveEventTargetIdentifierEntries(record) : []
+      const actorUserId = actorEntries.length ? await ensureUserByIdentifiers(actorEntries) : null
+      const targetUserId = targetEntries.length ? await ensureUserByIdentifiers(targetEntries) : senderUserId
+
+      if (!messageDbId) stats.skipped.noSource.message_db_id += 1
+      if (!actorUserId && !row.actor_user_id) stats.skipped.noSource.actor_user_id += 1
+      if (!targetUserId && !row.target_user_id) stats.skipped.noSource.target_user_id += 1
+      if (!messageDbId && !actorUserId && !targetUserId) continue
+
+      await pool.execute(
+        `UPDATE message_events
+         SET message_db_id = COALESCE(message_db_id, ?),
+             actor_user_id = COALESCE(actor_user_id, IF(?, UNHEX(REPLACE(?, '-', '')), NULL)),
+             target_user_id = COALESCE(target_user_id, IF(?, UNHEX(REPLACE(?, '-', '')), NULL))
+         WHERE connection_id = ?
+           AND id = ?`,
+        [messageDbId, actorUserId ? 1 : 0, actorUserId, targetUserId ? 1 : 0, targetUserId, connectionId, row.id]
+      )
+
+      if (messageDbId) stats.updated.message_db_id += 1
+      if (actorUserId) stats.updated.actor_user_id += 1
+      if (targetEntries.length === 0 && senderUserId && targetUserId) {
+        stats.resolved.targetFromMessageSender += 1
+      }
+      if (targetUserId) stats.updated.target_user_id += 1
+    }
+
+    logger.info('backfill step stats', { step: 'message_events', ...stats })
+    await setCheckpoint('message_events', rows[rows.length - 1]?.id ?? lastCheckpoint)
+  }
+
+  const backfillEventsLog = async () => {
+    const [fromMessages] = await pool.execute<ResultSetHeader>(
+      `UPDATE events_log e
+       INNER JOIN messages m
+         ON m.connection_id = e.connection_id
+        AND m.id = e.message_db_id
+       SET e.target_user_id = COALESCE(e.target_user_id, m.sender_user_id),
+           e.chat_jid = COALESCE(e.chat_jid, m.chat_jid),
+           e.group_jid = COALESCE(e.group_jid, IF(m.chat_jid LIKE '%@g.us', m.chat_jid, NULL))
+       WHERE e.connection_id = ?
+         AND (
+           e.target_user_id IS NULL
+           OR e.chat_jid IS NULL
+           OR e.group_jid IS NULL
+         )`,
+      [connectionId]
+    )
+    logAffected('events_log.refs(messages)', fromMessages)
+
+    // Two-step fetch for events_log to avoid sort memory issues
+    type IdRow = RowDataPacket & { id: number }
+    const lastCheckpoint = await getCheckpoint('events_log')
+    const [idRows] = await pool.execute<IdRow[]>(
+      `SELECT id FROM events_log
+       WHERE connection_id = ?
+         AND id > ?
+         AND (
+           actor_user_id IS NULL
+           OR target_user_id IS NULL
+           OR chat_jid IS NULL
+           OR group_jid IS NULL
+           OR message_db_id IS NULL
+         )
+       ORDER BY id ASC LIMIT ${BATCH_SIZE}`,
+      [connectionId, lastCheckpoint]
+    )
+
+    if (!idRows.length) {
+      await setCheckpoint('events_log', 0)
+      return
+    }
+    const ids = idRows.map((r) => r.id)
+
+    const [eventRows] = await pool.query<RowDataPacket[]>(`SELECT id, actor_user_id, target_user_id, chat_jid, group_jid, message_db_id, data_json FROM events_log WHERE id IN (?)`, [ids])
+
+    for (const row of eventRows) {
+      let record: Record<string, unknown> | null = null
+      try {
+        record = deserialize<Record<string, unknown>>(row.data_json)
+      } catch {
+        continue
+      }
+      if (!record) continue
+
+      if (!row.actor_user_id) {
+        const actorJid = pickFrom(record, ['actorJid', 'actor', 'author', 'from', 'sender'])
+        if (actorJid && isUserJid(actorJid)) {
+          const actorUserId = await ensureUserByJid(actorJid)
+          if (actorUserId) {
+            await pool.execute(
+              `UPDATE events_log SET actor_user_id = UNHEX(REPLACE(?, '-', ''))
+               WHERE connection_id = ? AND id = ? AND actor_user_id IS NULL`,
+              [actorUserId, connectionId, row.id]
+            )
+          }
+        }
+      }
+
+      const actorEntries = !row.actor_user_id ? resolveEventActorIdentifierEntries(record) : []
+      const targetEntries = !row.target_user_id ? resolveEventTargetIdentifierEntries(record) : []
+      const chatJid = !row.chat_jid ? resolveEventChatJid(record) : null
+      const groupJid = !row.group_jid ? resolveEventGroupJid(record) : null
+      const messageKey = resolveEventMessageKey(record)
+      const messageDbId = !row.message_db_id && messageKey ? await resolveMessageDbId(messageKey.chatJid, messageKey.messageId, messageKey.fromMe) : null
+      const senderUserId = await getMessageSenderUserId((row.message_db_id as number | null) ?? messageDbId)
+      const actorUserId = actorEntries.length ? await ensureUserByIdentifiers(actorEntries) : null
+      const targetUserId = targetEntries.length ? await ensureUserByIdentifiers(targetEntries) : senderUserId
+      if (!actorUserId && !targetUserId && !chatJid && !groupJid && !messageDbId) continue
+      await pool.execute(
+        `UPDATE events_log
+         SET actor_user_id = COALESCE(actor_user_id, IF(?, UNHEX(REPLACE(?, '-', '')), NULL)),
+             target_user_id = COALESCE(target_user_id, IF(?, UNHEX(REPLACE(?, '-', '')), NULL)),
+             chat_jid = COALESCE(chat_jid, ?),
+             group_jid = COALESCE(group_jid, ?),
+             message_db_id = COALESCE(message_db_id, ?)
+         WHERE connection_id = ?
+           AND id = ?`,
+        [actorUserId ? 1 : 0, actorUserId, targetUserId ? 1 : 0, targetUserId, chatJid, groupJid ?? (chatJid?.endsWith('@g.us') ? chatJid : null), messageDbId, connectionId, row.id]
+      )
+    }
+
+    await setCheckpoint('events_log', idRows[idRows.length - 1]?.id ?? lastCheckpoint)
+  }
+
+  const backfillLabels = async () => {
+    const selfUserId = await ensureSelfUserId()
+    if (!selfUserId) return
+    const [labelsResult] = await pool.execute<ResultSetHeader>(
+      `UPDATE labels
+       SET actor_user_id = UNHEX(REPLACE(?, '-', ''))
+       WHERE connection_id = ?
+         AND actor_user_id IS NULL`,
+      [selfUserId, connectionId]
+    )
+    logAffected('labels.actor_user_id', labelsResult)
+  }
+
+  const backfillLabelAssociations = async () => {
+    const selfUserId = await ensureSelfUserId()
+    if (selfUserId) {
+      const [actorResult] = await pool.execute<ResultSetHeader>(
+        `UPDATE label_associations
+         SET actor_user_id = UNHEX(REPLACE(?, '-', ''))
+         WHERE connection_id = ?
+           AND actor_user_id IS NULL`,
+        [selfUserId, connectionId]
+      )
+      logAffected('label_associations.actor_user_id', actorResult)
+    }
+
+    type AssocRow = RowDataPacket & {
+      label_id: string
+      association_type: 'chat' | 'message' | 'contact' | 'group'
+      chat_jid: string | null
+      message_db_id: number | null
+      target_jid: string | null
+      data_json: unknown
+    }
+    const [rows] = await pool.execute<AssocRow[]>(
+      `SELECT label_id, association_type, chat_jid, message_db_id, target_jid, data_json
+       FROM label_associations
+       WHERE connection_id = ?
+         AND (
+           message_db_id IS NULL
+           OR target_jid IS NULL
+         )
+       LIMIT ${BATCH_SIZE}`,
+      [connectionId]
+    )
+
+    for (const row of rows) {
+      const record = deserialize<Record<string, unknown>>(row.data_json)
+      if (!record) continue
+      const chatJid = row.chat_jid ?? pickNestedString(record, [['chatId'], ['chatJid']])
+      const messageId = pickNestedString(record, [['messageId'], ['messageKey', 'messageId']])
+      const fromMeValue = getNestedValue(record, ['messageKey', 'fromMe'])
+      const messageDbId = row.message_db_id ?? (chatJid && messageId ? await resolveMessageDbId(chatJid, messageId, typeof fromMeValue === 'boolean' ? fromMeValue : null) : null)
+      const targetJid = row.target_jid ?? (row.association_type === 'contact' ? pickNestedString(record, [['contactJid'], ['targetJid'], ['chatId']]) : row.association_type === 'group' ? pickNestedString(record, [['groupJid'], ['groupId'], ['chatId']]) : null)
+      if (!messageDbId && !targetJid) continue
+      await pool.execute(
+        `UPDATE label_associations
+         SET message_db_id = COALESCE(message_db_id, ?),
+             target_jid = COALESCE(target_jid, ?)
+         WHERE connection_id = ?
+           AND label_id = ?
+           AND association_type = ?
+           AND (chat_jid <=> ?)
+           AND (target_jid <=> ?)`,
+        [messageDbId, targetJid, connectionId, row.label_id, row.association_type, row.chat_jid, row.target_jid]
+      )
+    }
+  }
+
+  const backfillBlocklist = async () => {
+    const selfUserId = await ensureSelfUserId()
+    if (selfUserId) {
+      const [actorResult] = await pool.execute<ResultSetHeader>(
+        `UPDATE blocklist
+         SET actor_user_id = UNHEX(REPLACE(?, '-', ''))
+         WHERE connection_id = ?
+           AND actor_user_id IS NULL`,
+        [selfUserId, connectionId]
+      )
+      logAffected('blocklist.actor_user_id', actorResult)
+    }
+    const [reasonResult] = await pool.execute<ResultSetHeader>(
+      `UPDATE blocklist
+       SET reason = 'sync:blocklist'
+       WHERE connection_id = ?
+         AND reason IS NULL`,
+      [connectionId]
+    )
+    logAffected('blocklist.reason', reasonResult)
+  }
+
+  const backfillNewsletterEvents = async () => {
+    type NewsletterEventRow = RowDataPacket & {
+      id: number
+      actor_user_id: Buffer | null
+      target_user_id: Buffer | null
+      data_json: unknown
+    }
+    const [rows] = await pool.execute<NewsletterEventRow[]>(
+      `SELECT id, actor_user_id, target_user_id, data_json
+       FROM newsletter_events
+       WHERE connection_id = ?
+         AND (actor_user_id IS NULL OR target_user_id IS NULL)
+       LIMIT ${BATCH_SIZE}`,
+      [connectionId]
+    )
+
+    for (const row of rows) {
+      const record = deserialize<Record<string, unknown>>(row.data_json)
+      if (!record) continue
+      const actorEntries = !row.actor_user_id ? resolveEventActorIdentifierEntries(record) : []
+      const targetEntries = !row.target_user_id ? resolveEventTargetIdentifierEntries(record) : []
+      const actorUserId = actorEntries.length ? await ensureUserByIdentifiers(actorEntries) : null
+      const targetUserId = targetEntries.length ? await ensureUserByIdentifiers(targetEntries) : null
+      if (!actorUserId && !targetUserId) continue
+      await pool.execute(
+        `UPDATE newsletter_events
+         SET actor_user_id = COALESCE(actor_user_id, IF(?, UNHEX(REPLACE(?, '-', '')), NULL)),
+             target_user_id = COALESCE(target_user_id, IF(?, UNHEX(REPLACE(?, '-', '')), NULL))
+         WHERE connection_id = ?
+           AND id = ?`,
+        [actorUserId ? 1 : 0, actorUserId, targetUserId ? 1 : 0, targetUserId, connectionId, row.id]
+      )
+    }
+  }
+
+  const backfillMessageMediaFromLocalFiles = async () => {
+    if (!config.mediaAutoDownload) return
+
+    type MediaRow = RowDataPacket & {
+      id: number
+      local_path: string | null
+      file_length: number | null
+      file_name: string | null
+    }
+
+    const [rows] = await pool.execute<MediaRow[]>(
+      `SELECT id, local_path, file_length, file_name
+       FROM message_media
+       WHERE connection_id = ?
+         AND local_path IS NOT NULL
+         AND local_path <> ''
+         AND (file_length IS NULL OR file_name IS NULL OR file_name = '')
+       ORDER BY id ASC
+       LIMIT ${BATCH_SIZE}`,
+      [connectionId]
+    )
+
+    let updated = 0
+    for (const row of rows) {
+      const rawPath = normalizeString(row.local_path, { trim: true })
+      if (!rawPath) continue
+      const absolutePath = path.isAbsolute(rawPath) ? rawPath : path.resolve(process.cwd(), rawPath)
+
+      let sizeFromDisk: number | null = null
+      try {
+        const fileStat = await stat(absolutePath)
+        if (fileStat.isFile()) sizeFromDisk = fileStat.size
+      } catch {
+        continue
+      }
+
+      const nameFromPath = path.basename(absolutePath)
+      const nextFileLength = row.file_length ?? sizeFromDisk
+      const nextFileName = row.file_name && row.file_name.trim() ? row.file_name : nameFromPath
+      if (nextFileLength === row.file_length && nextFileName === row.file_name) continue
+
+      const [result] = await pool.execute<ResultSetHeader>(
+        `UPDATE message_media
+         SET file_length = COALESCE(file_length, ?),
+             file_name = CASE
+               WHEN file_name IS NULL OR file_name = '' THEN ?
+               ELSE file_name
+             END
+         WHERE connection_id = ?
+           AND id = ?`,
+        [nextFileLength, nextFileName, connectionId, row.id]
+      )
+      updated += result.affectedRows
+    }
+
+    if (updated > 0) {
+      logger.info('backfill atualizado', { item: 'message_media.local_file_metadata', affected: updated })
+    }
+  }
+
+  async function runCycle() {
+    const runStep = async (stepName: string, step: () => Promise<void>) => {
+      const startedAt = Date.now()
+      try {
+        await step()
+        logger.info('backfill step concluido', { step: stepName, durationMs: Date.now() - startedAt })
+      } catch (error) {
+        logger.error('backfill step com erro', { step: stepName, durationMs: Date.now() - startedAt, err: error })
+      }
+    }
+
+    let pass = 0
+    let finalBefore: Record<string, number> | null = null
+    let finalAfter: Record<string, number> | null = null
+
+    while (pass < MAX_PASSES_PER_CYCLE) {
+      pass += 1
+      const before = await collectBackfillMetrics()
+      if (!finalBefore) finalBefore = before
+
+      // Prioridade crítica: reduzir nulos de identidade/nomes visíveis primeiro.
+      await runStep('contacts_user_id', backfillContactsUserId)
+      await runStep('lid_mappings', backfillLidMappings)
+      await runStep('contacts_display_names', backfillContactsDisplayNames)
+      await runStep('chats', backfillChats)
+      await runStep('users_display_names', backfillUsersDisplayNames)
+      await runStep('messages', backfillMessages)
+      await runStep('message_events', backfillMessageEvents)
+      await runStep('groups_and_participants', backfillGroupsAndParticipants)
+      await runStep('chat_users_direct', backfillChatUsersDirect)
+      await runStep('labels', backfillLabels)
+      await runStep('label_associations', backfillLabelAssociations)
+      await runStep('blocklist', backfillBlocklist)
+      await runStep('newsletter_events', backfillNewsletterEvents)
+      await runStep('message_media_local_files', backfillMessageMediaFromLocalFiles)
+      await runStep('events_log', backfillEventsLog)
+      await runStep('messages_sender_bulk', async () => {
+        const [msgUpdate] = await pool!.execute<ResultSetHeader>(
+          `UPDATE messages m
+           INNER JOIN user_identifiers ui ON ui.id_value = m.chat_jid AND ui.connection_id = m.connection_id
+           SET m.sender_user_id = ui.user_id
+           WHERE m.connection_id = ? AND m.sender_user_id IS NULL AND m.from_me = 0 AND ui.id_type = 'jid'`,
+          [connectionId]
+        )
+        if (msgUpdate.affectedRows) logger.info('batch: sender_user_id atualizado', { affected: msgUpdate.affectedRows })
+      })
+
+      const after = await collectBackfillMetrics()
+      finalAfter = after
+      const progressed = Object.keys(after).some((key) => (before[key] ?? 0) > (after[key] ?? 0))
+      const pending = Object.values(after).reduce((sum, value) => sum + value, 0)
+
+      logger.info('backfill passe concluido', { connectionId, pass, pending, progressed })
+      if (!progressed || pending === 0) break
+    }
+
+    const before = finalBefore ?? (await collectBackfillMetrics())
+    const after = finalAfter ?? (await collectBackfillMetrics())
+    const deltas = Object.fromEntries(Object.keys(after).map((key) => [key, { before: before[key] ?? 0, after: after[key] ?? 0, delta: (before[key] ?? 0) - (after[key] ?? 0) }]))
+    logger.info('backfill ciclo concluido', { connectionId, passes: pass, deltas })
+  }
+
+  if (process.env.WA_BACKFILL_ONCE === 'true') {
+    await runCycle()
+    await pool.end()
+    return
+  }
+
+  // Worker Loop
+  while (true) {
+    const start = Date.now()
+    await runCycle()
+    const duration = Date.now() - start
+    const wait = Math.max(1000, WORKER_INTERVAL_MS - duration)
+    await new Promise((resolve) => setTimeout(resolve, wait))
+  }
+}
+
+main().catch((error) => {
+  logger.error('falha fatal no backfill', { err: error })
+  process.exitCode = 1
+})

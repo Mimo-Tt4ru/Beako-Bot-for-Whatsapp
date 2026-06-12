@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.env
+logs/
+data/
+.codex
+.vscode/
+.baileys-last-known-good-version.json
+.beako-data/group-features.json
+src/commands/nsfw.ts

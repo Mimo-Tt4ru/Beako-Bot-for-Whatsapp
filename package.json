@@ -1,0 +1,98 @@
+{
+  "name": "beako",
+  "version": "0.1.1",
+  "description": "Sistema modular para WhatsApp focado em comandos, automação e gerenciamento de grupos.",
+  "private": false,
+  "license": "MIT",
+  "type": "module",
+  "author": "Andrew-MimoTt4ru",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kaikybrofc/beako.git"
+  },
+  "bugs": {
+    "url": "https://github.com/kaikybrofc/zyra/issues"
+  },
+  "homepage": "https://github.com/kaikybrofc/zyra#readme",
+  "keywords": [
+    "whatsapp",
+    "bot",
+    "baileys",
+    "nodejs",
+    "typescript",
+    "redis",
+    "mysql",
+    "pm2",
+    "automation"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc -p tsconfig.json && cp src/api/dashboard.html dist/api/dashboard.html",
+    "start": "tsx src/index.ts",
+    "start:prod": "node dist/index.js",
+    "pm2:start": "npm run build && pm2 startOrRestart ecosystem.config.cjs --env production",
+    "pm2:restart": "npm run build && pm2 restart ecosystem.config.cjs --env production",
+    "pm2:stop": "pm2 stop beako beako-api-webhook beako-backfill",
+    "pm2:delete": "pm2 delete beako beako-api-webhook beako-backfill",
+    "pm2:logs": "pm2 logs beako beako-api-webhook beako-backfill",
+    "pm2:save": "pm2 save",
+    "pm2:startup": "pm2 startup",
+    "session:pair": "tsx src/core/connection/pair.ts",
+    "db:init": "tsx src/core/db/init.ts",
+    "db:verify": "tsx src/core/db/verify.ts",
+    "db:delete-session": "tsx src/core/db/delete-session.ts",
+    "db:backfill": "tsx src/core/db/backfill.ts",
+    "db:repair-group-participants": "tsx src/core/db/repair-group-participants.ts",
+    "db:nulls": "tsx src/core/db/null-report.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit && vitest --run --typecheck",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "postinstall": "patch-package",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@caed0/webp-conv": "^2.2.3",
+    "@hapi/boom": "^10.0.1",
+    "baileys": "npm:@whiskeysockets/baileys@7.0.0-rc13",
+    "baileys-antiban": "3.9.0",
+    "dotenv": "^16.4.5",
+    "fflate": "^0.8.2",
+    "libsignal": "^6.0.0",
+    "link-preview-js": "4.0.1",
+    "linkifyjs": "^4.3.3",
+    "logform": "^2.7.0",
+    "mysql2": "^3.20.0",
+    "pm2": "^7.0.1",
+    "qrcode-terminal": "^0.12.0",
+    "redis": "^4.6.13"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.0.0",
+    "@types/node": "^22.13.5",
+    "@types/qrcode-terminal": "^0.12.2",
+    "eslint": "^9.0.0",
+    "patch-package": "^8.0.1",
+    "prettier": "^3.8.1",
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3",
+    "typescript-eslint": "^8.0.0",
+    "vitest": "^4.1.2",
+    "winston": "^3.18.3",
+    "winston-daily-rotate-file": "^5.0.0"
+  },
+  "overrides": {
+    "vite": "8.0.5",
+    "basic-ftp": "5.3.1",
+    "baileys": {
+      "libsignal": "$libsignal"
+    },
+    "pm2": {
+      "ws": "8.20.1"
+    },
+    "link-preview-js": "4.0.1"
+  }
+}
